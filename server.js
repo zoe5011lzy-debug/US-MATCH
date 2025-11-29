@@ -6,6 +6,7 @@
 //   - 同一组玩家完成过某 US，一模一样的组合不能再触发该 US（除非组合发生变化）
 //   - fusion 结束后立刻锁回 US（lockback 5 秒），此时进行统计 & 排行榜
 //   - 捕捉期间不断补充同色 match 点（不会出现 0 个）
+//   - 只有参与该 US 任务的玩家才能捕捉 match 点 & 参与该轮统计
 
 const express = require('express');
 const http = require('http');
@@ -20,7 +21,8 @@ app.use(express.static('public'));
 // ---------------------------
 // 玩家
 // ---------------------------
-const players = new Map(); // id -> { x, y }
+// id -> { x, y, name }
+const players = new Map();
 
 // ---------------------------
 // US 点
@@ -265,12 +267,12 @@ function onUSFusionEnd(us) {
   // lastRoundId 已在 lockback 开始时写入
 }
 
-// 生成一批 match 点
+// 生成一批 match 点（3 种 US 颜色，数量略增）
 function spawnMatchDots(us, roundId) {
   if (!usPoints.length) return;
 
   const colors = usPoints.map(u => u.color);
-  const total = 120; // 初始总量，可调
+  const total = 220; // 比原来多一些，让屏幕更满
 
   for (let i = 0; i < total; i++) {
     matchDots.push({
@@ -304,6 +306,7 @@ function updateMatchDots(now) {
   const fusionColor = fusionUS ? fusionUS.color.toLowerCase() : null;
   const fusionUSId = fusionUS ? fusionUS.id : null;
   const currentRoundId = fusionUS ? fusionUS.currentRoundId : null;
+  const allowedCapturers = fusionUS ? (fusionUS.currentGroup || []) : [];
 
   // 飘动 + 捕捉
   matchDots.forEach(d => {
@@ -329,6 +332,9 @@ function updateMatchDots(now) {
         (d.colorHex || '').toLowerCase() === fusionColor
       ) {
         players.forEach((p, pid) => {
+          // ⭐ 只有参与该 US 任务的玩家可以捕捉
+          if (!allowedCapturers.includes(pid)) return;
+
           if (d.state !== 'free') return;
           const dx = d.xRel - p.x;
           const dy = d.yRel - p.y;
@@ -343,7 +349,7 @@ function updateMatchDots(now) {
     // captured 点不再移动，位置交给前端去解释（尾巴）
   });
 
-  // ⭐ 补充逻辑：在 fusion 期间，同色 free match 点如果为 0，就补一个
+  // 补充逻辑：在 fusion 期间，同色 free match 点如果为 0，就补一个
   if (
     matchActive &&
     fusionColor &&
@@ -362,7 +368,7 @@ function updateMatchDots(now) {
       }
     });
 
-    if (freeCount === 0) {
+    if (freeCount === 0 && fusionUS) {
       matchDots.push({
         id: `m-supply-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
         xRel: Math.random(),
@@ -385,7 +391,11 @@ function updateMatchDots(now) {
 function serializePlayers() {
   const obj = {};
   players.forEach((p, id) => {
-    obj[id] = { x: p.x, y: p.y };
+    obj[id] = {
+      x: p.x,
+      y: p.y,
+      name: p.name || null
+    };
   });
   return obj;
 }
@@ -415,7 +425,7 @@ io.on('connection', (socket) => {
 
   const startX = Math.random() * 0.6 + 0.2;
   const startY = Math.random() * 0.6 + 0.2;
-  players.set(socket.id, { x: startX, y: startY });
+  players.set(socket.id, { x: startX, y: startY, name: null });
 
   socket.emit('init', {
     id: socket.id,
@@ -426,7 +436,8 @@ io.on('connection', (socket) => {
   socket.broadcast.emit('playerJoined', {
     id: socket.id,
     x: startX,
-    y: startY
+    y: startY,
+    name: null
   });
 
   socket.on('updatePlayer', (data) => {
@@ -434,6 +445,20 @@ io.on('connection', (socket) => {
     if (!p) return;
     if (typeof data.x === 'number') p.x = clamp01(data.x);
     if (typeof data.y === 'number') p.y = clamp01(data.y);
+  });
+
+  // 新增：设置用户名（标识）
+  socket.on('setName', (data) => {
+    const p = players.get(socket.id);
+    if (!p) return;
+    if (data && typeof data.name === 'string') {
+      const trimmed = data.name.trim();
+      if (trimmed.length > 0) {
+        // 控制一下长度，避免太长
+        p.name = trimmed.slice(0, 20);
+        io.emit('playerName', { id: socket.id, name: p.name });
+      }
+    }
   });
 
   socket.on('disconnect', () => {

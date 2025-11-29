@@ -15,15 +15,24 @@
 // - lockback 阶段（5s）：
 //   - 捕捉结束后，参与者被服务器强制拉回 US 圆，锁在圈内 5 秒
 //   - 顶部用 US 颜色显示“这一轮总共捕捉了多少个 match 点”
-//   - 右侧显示单个玩家捕捉数量排行榜（Top 1–10）
+//   - 左侧显示单个玩家捕捉数量排行榜（Top 1–10），按 Yellow / Blue / Pink 分块
 // - lockback 结束 → idle：这一轮参与者之间生成记忆实线（多颜色并列）
 //
 // match 尾巴：
 // - free：满屏飘的小点（US 颜色轮换）
 // - captured：按玩家分组，在玩家移动方向反向形成一条“鞭子/水草尾巴”，点之间保持间距，不重叠，有惯性甩动
+//
+// 新增：
+// - US 标识：每个 US 圆正上方有 “YELLOW US / BLUE US / PINK US” 像素字标注
+// - 玩家名称标识：进入前输入名字，显示在玩家点正下方（高度为半个半径）
+// - 只有参与当前 US 任务的玩家可以捕捉 match 点和参与该轮统计（服务端逻辑）
+// - 完成 3 个 US 任务后触发 3 秒全屏 US MATCH COMBO 液体背景 + 大字闪烁
+// - fusion 期间 match 点数量略增（由后端控制）
+// - 顶部提示 & 榜单改用 DOM：#ui-top-message + #ui-ranking
 
 let socket;
 let myId = null;
+let myName = '';
 let players = {};      // id -> Player
 let usPoints = [];     // USPoint[]
 
@@ -38,17 +47,45 @@ let matchActive = false;
 let matchFusionUSId = null;
 let matchDots = [];
 
-// 仅前端使用：记录每个 match 点的“惯性位置”，做鞭子/水草效果
-let matchVisualPositions = {}; // dotId -> { x, y }
+// match 尾巴可视缓存：dotId -> { x, y }
+let matchVisualPositions = {};
 
 // 用于排行榜/统计的 match 快照：key = `${usId}|${roundId}` -> [dot, ...]
 let matchDotsSnapshots = {};
+
+// US MATCH COMBO 结束画面
+let comboActive = false;
+let comboStartTime = 0;
+let comboBlobs = [];
+let comboCelebratedGroups = new Set(); // 记录已经达成 combo 的组，避免重复触发
+
+const COMBO_DURATION_MS = 3000;
+
+// 入口 overlay 状态
+let hasEnteredGame = false;
+
+const UI_FONT_NAME = 'Press Start 2P';
+
+// DOM 元素（顶部提示 + 左侧总榜单）
+let uiTopMessageEl = null;
+let uiRankingEl = null;
+// ⭐ 新增：ending 的 DOM 大字图层（index.html 里如果没有这个 div，不会报错，只是为 null）
+let comboOverlayEl = null;
 
 // ---------------------------
 // p5 lifecycle
 // ---------------------------
 function setup() {
   createCanvas(windowWidth, windowHeight);
+
+  // 全局使用像素游戏字体（p5 画布上）
+  textFont(UI_FONT_NAME);
+
+  // 绑定 DOM 元素
+  uiTopMessageEl = document.getElementById('ui-top-message');
+  uiRankingEl = document.getElementById('ui-ranking');
+  comboOverlayEl = document.getElementById('combo-overlay'); // ⭐ 新增绑定
+
   socket = io();
 
   socket.on('init', (data) => {
@@ -57,13 +94,13 @@ function setup() {
 
     for (const id in data.players) {
       const p = data.players[id];
-      players[id] = new Player(id, p.x, p.y);
+      players[id] = new Player(id, p.x, p.y, p.name || '');
     }
   });
 
   socket.on('playerJoined', (p) => {
     if (!players[p.id]) {
-      players[p.id] = new Player(p.id, p.x, p.y);
+      players[p.id] = new Player(p.id, p.x, p.y, p.name || '');
     }
   });
 
@@ -71,14 +108,21 @@ function setup() {
     delete players[id];
   });
 
+  socket.on('playerName', (data) => {
+    const p = players[data.id];
+    if (p && typeof data.name === 'string') {
+      p.displayName = data.name;
+    }
+  });
+
   socket.on('state', (data) => {
     // 更新玩家
     for (const id in data.players) {
       const s = data.players[id];
       if (!players[id]) {
-        players[id] = new Player(id, s.x, s.y);
+        players[id] = new Player(id, s.x, s.y, s.name || '');
       } else {
-        players[id].updateFromServer(s.x, s.y);
+        players[id].updateFromServer(s.x, s.y, s.name || null);
       }
     }
     for (const id in players) {
@@ -104,6 +148,35 @@ function setup() {
       matchDots = Array.isArray(data.match.dots) ? data.match.dots : [];
     }
   });
+
+  // 入口 overlay：处理名字输入
+  const overlay = document.getElementById('intro-overlay');
+  const startBtn = document.getElementById('startBtn');
+  const usernameInput = document.getElementById('usernameInput');
+
+  if (overlay && startBtn && usernameInput) {
+    overlay.style.display = 'flex';
+
+    const startGame = () => {
+      const name = usernameInput.value.trim();
+      myName = name || 'PLAYER';
+      hasEnteredGame = true;
+
+      if (players[myId]) {
+        players[myId].displayName = myName;
+      }
+      if (socket && socket.connected) {
+        socket.emit('setName', { name: myName });
+      }
+
+      overlay.style.display = 'none';
+    };
+
+    startBtn.addEventListener('click', startGame);
+    usernameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') startGame();
+    });
+  }
 }
 
 function windowResized() {
@@ -144,25 +217,28 @@ function draw() {
   // 画静止引导虚线（A↔B + A→US + B→US）——底层
   drawStillGuides();
 
-  // 画 US 圆
+  // 画 US 圆 + US 标识文字
   usPoints.forEach(u => u.drawBase());
 
   // 画 match 点（free + 尾巴）
   drawMatchDots(nowGlobal);
 
-  // 画玩家点
+  // 画玩家点 + 名称标识
   for (const id in players) {
     players[id].draw(nowGlobal);
   }
 
-  // 画 fusion 阶段 US 内部倒计时
+  // 画 fusion 阶段 US 内部倒计时（在圆里）
   drawFusionCountdown(nowGlobal);
 
-  // 画右侧排行榜（lockback 阶段）
-  drawLockbackRanking();
+  // 顶部文字（gathering / fusion / lockback 总结）—— 改 DOM
+  updateTopMessageDOM(nowGlobal);
 
-  // 顶部文字（gathering / fusion / lockback 总结）
-  drawTopMessages(nowGlobal);
+  // 左侧总榜单（Yellow / Blue / Pink）—— 改 DOM
+  updateRankingDOM();
+
+  // 若达成 3 个 US 任务的组合 → 全屏 US MATCH COMBO 结束画面（3 秒）
+  drawComboOverlay(nowGlobal);
 }
 
 function drawLoading() {
@@ -232,7 +308,7 @@ class USPoint {
       : (this.gatheringDuration || 5000);
 
     this.fusionStart = data.fusionStart || null;
-    this.fusionDuration = typeof data.fusionDuration === 'number'
+       this.fusionDuration = typeof data.fusionDuration === 'number'
       ? data.fusionDuration
       : (this.fusionDuration || 0);
 
@@ -335,6 +411,16 @@ class USPoint {
     }
     ellipse(pos.x, pos.y, r * 2, r * 2);
     pop();
+
+    // US 标识文字（例如：YELLOW US / BLUE US / PINK US）
+    const label = ((this.name || '') + ' US').toUpperCase();
+    push();
+    fill(0);
+    noStroke();
+    textAlign(CENTER, BOTTOM);
+    textSize(r / 3); // 大小为 1/3 半径
+    text(label, pos.x, pos.y - r * 1.1);
+    pop();
   }
 }
 
@@ -342,7 +428,7 @@ class USPoint {
 // Player 类
 // ===========================
 class Player {
-  constructor(id, xRel, yRel) {
+  constructor(id, xRel, yRel, displayName) {
     this.id = id;
     this.xRel = xRel;
     this.yRel = yRel;
@@ -350,6 +436,8 @@ class Player {
     this.haloActive = false;
     this.haloColorHex = null;
     this.bodyColorHex = '#000000';
+
+    this.displayName = displayName || '';
 
     // 运动状态
     this.prevXRel = null;
@@ -382,10 +470,14 @@ class Player {
     // 不重置 tailDir/vx/vy，保持跨帧连续
   }
 
-  updateFromServer(xRel, yRel) {
-    if (this.id === myId) return; // 自己的位置用本地输入
-    this.xRel = xRel;
-    this.yRel = yRel;
+  updateFromServer(xRel, yRel, name) {
+    if (this.id !== myId) {
+      this.xRel = xRel;
+      this.yRel = yRel;
+    }
+    if (typeof name === 'string' && name.length > 0) {
+      this.displayName = name;
+    }
   }
 
   updateMotionState(nowGlobal) {
@@ -561,6 +653,18 @@ class Player {
     fill(bodyCol);
     ellipse(pos.x, pos.y, rPlayer * 2, rPlayer * 2);
     pop();
+
+    // 玩家名称标识：显示在点的正下方，高度约为半个半径
+    if (this.displayName) {
+      push();
+      fill(0);
+      noStroke();
+      textAlign(CENTER, TOP);
+      const labelSize = rPlayer * 0.5;
+      textSize(labelSize);
+      text(this.displayName, pos.x, pos.y + rPlayer * 1.2);
+      pop();
+    }
   }
 }
 
@@ -784,10 +888,16 @@ function updateGuideGroups() {
 // ===========================
 function onUSTaskCompleted(groupIds, colorHex) {
   const sorted = groupIds.slice().sort();
+
   for (let i = 0; i < sorted.length; i++) {
     for (let j = i + 1; j < sorted.length; j++) {
       addCompletedLine(sorted[i], sorted[j], colorHex);
     }
+  }
+
+  // 若该组已经完成所有 3 个 US，则触发 US MATCH COMBO 结束画面
+  if (hasGroupCompletedAllUS(sorted)) {
+    triggerComboForGroup(sorted);
   }
 }
 
@@ -969,64 +1079,54 @@ function drawFusionCountdown(nowGlobal) {
 }
 
 // ===========================
-// 顶部提示：gathering / fusion / lockback 文案
+// 顶部提示（DOM）：gathering / fusion / lockback 文案
 // ===========================
-function drawTopMessages(nowGlobal) {
-  if (usPoints.length === 0) return;
+function updateTopMessageDOM(nowGlobal) {
+  if (!uiTopMessageEl || usPoints.length === 0) return;
 
-  const maxR = usPoints.reduce((acc, u) => max(acc, u.radiusPx()), 0);
-  const baseSize = maxR * 0.5;
-  const lineHeight = baseSize * 1.2;
+  // 1. 优先显示 lockback 的总结（有数据的时候）
+  for (const us of usPoints) {
+    if (us.state === 'lockback' && us.lastRoundId != null) {
+      const stats = computeLockbackStats(us);
+      if (stats && stats.total > 0 && stats.numPlayers >= 1) {
+        // 换行：At XXX us, / you captured ...
+        const html = `At ${us.name} us,<br>you captured ${stats.total} match dots together`;
+        uiTopMessageEl.innerHTML = html;
+        uiTopMessageEl.style.color = us.colorHex || '#000000';
+        return;
+      }
+    }
+  }
 
-  const messages = [];
-
-  usPoints.forEach(us => {
+  // 2. 其次显示 gathering 倒计时（也加换行）
+  for (const us of usPoints) {
     if (us.state === 'gathering') {
       const remainMs = us.gatheringRemaining(nowGlobal);
       let remainSec = Math.ceil(remainMs / 1000);
       if (remainSec > 5) remainSec = 5;
       if (remainSec > 0) {
-        messages.push(`${remainSec}s left before ${us.name} us stops accepting new players`);
+        const html = `${remainSec}s left before<br>${us.name} us stops accepting new players`;
+        uiTopMessageEl.innerHTML = html;
+        uiTopMessageEl.style.color = '#000000';
+        return;
       }
     }
+  }
 
+  // 3. 再次显示 fusion 提示（单行就好）
+  for (const us of usPoints) {
     if (us.state === 'fusion') {
       const elapsedSec = us.fusionElapsed(nowGlobal) / 1000;
       if (elapsedSec >= 1) {
-        messages.push('Try to collect them together');
+        uiTopMessageEl.innerHTML = 'Try to collect them together';
+        uiTopMessageEl.style.color = '#000000';
+        return;
       }
     }
+  }
 
-    if (us.state === 'lockback' && us.lastRoundId != null) {
-      const stats = computeLockbackStats(us);
-      // 🔴 改动：只要有至少 1 个玩家有数据就显示
-      if (stats && stats.total > 0 && stats.numPlayers >= 1) {
-        const col = color(us.colorHex);
-        push();
-        textAlign(CENTER, TOP);
-        textSize(baseSize);
-        fill(col);
-        noStroke();
-        const txt = `At ${us.name} us, you captured ${stats.total} match dots together`;
-        text(txt, width / 2, 10);
-        pop();
-        return; // 已经画了主标题，就不叠加其他 message
-      }
-    }
-  });
-
-  if (messages.length === 0) return;
-
-  push();
-  fill(0);
-  noStroke();
-  textAlign(CENTER, TOP);
-  textSize(baseSize);
-  const startY = 10;
-  messages.forEach((msg, i) => {
-    text(msg, width / 2, startY + i * lineHeight);
-  });
-  pop();
+  // 4. 没有任何状态 → 清空
+  uiTopMessageEl.innerHTML = '';
 }
 
 // ================
@@ -1092,49 +1192,42 @@ function computeLockbackStats(us) {
   };
 }
 
-// 右侧排行榜（单个玩家捕捉数量排行）
-function drawLockbackRanking() {
-  const us = usPoints.find(u => u.state === 'lockback' && u.lastRoundId != null);
-  if (!us) return;
+// ===========================
+// 左侧总榜单（DOM）：Yellow / Blue / Pink US
+// ===========================
+function updateRankingDOM() {
+  if (!uiRankingEl || usPoints.length === 0) return;
 
-  const stats = computeLockbackStats(us);
-  // 🔴 改动：只要有至少 1 条记录就显示 Top 1
-  if (!stats || stats.total <= 0 || stats.entries.length < 1) return;
+  const ordered = getOrderedUS(); // Yellow → Blue → Pink
+  let html = '';
 
-  const col = color(us.colorHex);
-  const maxEntries = 10;
-  const list = stats.entries.slice(0, maxEntries);
+  ordered.forEach(us => {
+    if (us.lastRoundId == null) return; // 这个 us 还没有任何一轮完成，先不展示
 
-  const marginRight = 20;
-  const marginTop = 80;
-  const lineH = 22;
-  const boxWidth = 220;
-  const boxHeight = lineH * (list.length + 2);
+    const stats = computeLockbackStats(us);
+    if (!stats || stats.total <= 0 || !stats.entries || stats.entries.length === 0) return;
 
-  const x = width - marginRight - boxWidth;
-  const y = marginTop;
+    const maxEntries = 10;
+    const list = stats.entries.slice(0, maxEntries);
+    const usName = us.name || '';
 
-  push();
-  rectMode(CORNER);
-  noStroke();
-  fill(255, 240);
-  rect(x, y, boxWidth, boxHeight, 10);
+    html += `<div class="section">`;
+    html += `<div class="section-title" style="color:${us.colorHex || '#000000'}">${usName} us</div>`;
 
-  fill(col);
-  textAlign(LEFT, TOP);
-  textSize(16);
-  text(`Top collectors @ ${us.name}`, x + 12, y + 8);
+    list.forEach((e, i) => {
+      const pidShort = e.playerId.slice(0, 4).toUpperCase();
+      const playerObj = players[e.playerId];
+      const nameLabel = playerObj && playerObj.displayName
+        ? playerObj.displayName
+        : `Player ${pidShort}`;
+      const rank = i + 1;
+      html += `<div class="entry">${rank}. ${nameLabel} - ${e.count}</div>`;
+    });
 
-  fill(0);
-  textSize(14);
-  list.forEach((e, i) => {
-    const pidShort = e.playerId.slice(0, 4).toUpperCase();
-    const rank = i + 1;
-    const line = `${rank}. Player ${pidShort} - ${e.count}`;
-    text(line, x + 12, y + 8 + (i + 1) * lineH);
+    html += `</div>`;
   });
 
-  pop();
+  uiRankingEl.innerHTML = html;
 }
 
 // ===========================
@@ -1229,7 +1322,7 @@ function drawMatchDots(nowGlobal) {
     }
     tailDirVec.normalize();
 
-    // 鞭子的参数：距离 & 间距 & 惯性
+    // 鞭子的参数：距离 & 间距 & 惯性（保持原有效果）
     const startDist = rPlayer * 0.9;   // 第一个 match 点离玩家的距离
     const spacing = rDot * 1.8;        // 每个 match 点之间的距离（避免重叠）
     const followSpeed = 0.25;          // 越小越“粘稠”、越有惯性
@@ -1280,4 +1373,118 @@ function drawMatchDots(nowGlobal) {
       targetY = newY + tailDirVec.y * spacing;
     }
   }
+}
+
+// ===========================
+// US MATCH COMBO 结束画面
+// ===========================
+function triggerComboForGroup(groupIds) {
+  const sorted = groupIds.slice().sort();
+  const key = sorted.join('|');
+  if (comboCelebratedGroups.has(key)) return;
+
+  comboCelebratedGroups.add(key);
+  comboActive = true;
+  comboStartTime = Date.now();
+  initComboBlobs();
+
+  // ⭐ 新增：触发时打开 DOM overlay（如果 index 里有 <div id="combo-overlay">）
+  if (comboOverlayEl) {
+    comboOverlayEl.style.display = 'flex';
+  }
+}
+
+function initComboBlobs() {
+  comboBlobs = [];
+  const orderedUS = getOrderedUS();
+  const colors = orderedUS.map(u => u.colorHex);
+  if (colors.length === 0) return;
+
+  const minSide = min(width, height);
+  const baseRMin = minSide * 0.4;
+  const baseRMax = minSide * 0.8;
+
+  const blobsPerColor = 6;
+
+  for (let ci = 0; ci < colors.length; ci++) {
+    const col = colors[ci];
+    for (let i = 0; i < blobsPerColor; i++) {
+      const r = random(baseRMin, baseRMax);
+      const x = random(-r, width + r);
+      const y = random(-r, height + r);
+      const speedScale = minSide * 0.002;
+      const vx = random(-speedScale, speedScale);
+      const vy = random(-speedScale, speedScale);
+      comboBlobs.push({
+        x, y, r, vx, vy, col
+      });
+    }
+  }
+}
+
+function drawComboOverlay(nowGlobal) {
+  // ⭐ 如果 combo 关了，顺便确保 DOM overlay 被隐藏
+  if (!comboActive) {
+    if (comboOverlayEl) comboOverlayEl.style.display = 'none';
+    return;
+  }
+
+  const elapsed = nowGlobal - comboStartTime;
+  if (elapsed > COMBO_DURATION_MS) {
+    comboActive = false;
+    if (comboOverlayEl) comboOverlayEl.style.display = 'none';
+    return;
+  }
+
+  // 白色背景
+  push();
+  noStroke();
+  fill(255);
+  rect(0, 0, width, height);
+  pop();
+
+  // 像液体/气体一样缓慢流动的大圆（三种 US 颜色，不改透明度）
+  comboBlobs.forEach(b => {
+    b.x += b.vx;
+    b.y += b.vy;
+
+    // 边缘循环（在“玻璃缸”里活动）
+    if (b.x - b.r > width && b.vx > 0) b.x = -b.r;
+    if (b.x + b.r < 0 && b.vx < 0) b.x = width + b.r;
+    if (b.y - b.r > height && b.vy > 0) b.y = -b.r;
+    if (b.y + b.r < 0 && b.vy < 0) b.y = height + b.r;
+
+    push();
+    noStroke();
+    fill(b.col);
+    ellipse(b.x, b.y, b.r * 2, b.r * 2);
+    pop();
+  });
+
+  // 中央大字：US（换行）MATCH COMBO!!，白色 + 黑白闪光（画布版还保留）
+  const minSide = min(width, height);
+  const maxRUS = usPoints.length
+    ? usPoints.reduce((acc, u) => max(acc, u.radiusPx()), 0)
+    : minSide / 4;
+
+  const baseTextSize = max(minSide / 4, maxRUS * 2); // 至少占屏幕 1/4，高于两个 US 直径
+  const textStr = 'US\nMATCH COMBO!!';
+
+  const phase = Math.floor(nowGlobal / 200) % 2;
+
+  push();
+  textAlign(CENTER, CENTER);
+  textSize(baseTextSize * 0.6);
+
+  if (phase === 0) {
+    fill(255);
+    stroke(0);
+  } else {
+    fill(0);
+    stroke(255);
+  }
+  strokeWeight(8);
+
+  text(textStr, width / 2, height / 2);
+  pop();
 }

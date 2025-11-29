@@ -1,14 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>US Cooperative System</title>
+  <meta charset="UTF-8">
+  <title>Match US - Interactive System</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-  <!-- p5.js -->
-  <script src="https://cdn.jsdelivr.net/npm/p5@1.6.0/lib/p5.min.js"></script>
-
-  <!-- socket.io -->
-  <script src="/socket.io/socket.io.js"></script>
+  <!-- Google Pixel Font -->
+  <link rel="preconnect" href="https://fonts.gstatic.com">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap"
+    rel="stylesheet">
 
   <style>
     html, body {
@@ -16,15 +17,184 @@
       padding: 0;
       overflow: hidden;
       background: #ffffff;
-      font-family: Arial, sans-serif;
+      font-family: 'Press Start 2P', monospace;
     }
-    canvas {
-      display: block;
+
+    /* 让文字有一点像素感 */
+    body, canvas {
+      image-rendering: pixelated;
+      -webkit-font-smoothing: none;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* 顶部提示文字：限制宽度，可以自动换行 */
+    #ui-top-message {
+      position: fixed;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 60vw;           /* 限制宽度，让长句子自动折行 */
+      text-align: center;
+      font-family: 'Press Start 2P', monospace;
+      font-size: 2.2vw;          /* 大字号，可再自己调 */
+      line-height: 1.4;
+      white-space: normal;       /* 允许换行 */
+      z-index: 5;
+      pointer-events: none;
+    }
+
+    /* 左侧总榜单容器：一直存在，挪到左边 */
+    #ui-ranking {
+      position: fixed;
+      top: 90px;
+      left: 20px;
+      right: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;                  /* 各 US 小块之间的间隔 */
+      font-family: 'Press Start 2P', monospace;
+      font-size: 1.3vw;           /* 榜单基准字号 */
+      line-height: 1.1;           /* 行距变近 */
+      z-index: 5;
+      pointer-events: none;
+    }
+
+    #ui-ranking .section {
+      margin-bottom: 12px;
+    }
+
+    #ui-ranking .section-title {
+      margin-bottom: 4px;
+    }
+
+    #ui-ranking .entry {
+      margin: 2px 0;             /* 每一名之间更紧凑 */
+    }
+
+    /* 入口 overlay（英文规则说明） */
+    #intro-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      color: white;
+      display: none;             /* 进游戏前用 JS 设置为 flex */
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 30px;
+      text-align: center;
+      z-index: 10;
+    }
+
+    #intro-overlay h1 {
+      font-size: 24px;
+      margin-bottom: 30px;
+    }
+
+    #intro-overlay p {
+      font-size: 12px;
+      line-height: 1.6;
+      max-width: 520px;
+      margin-bottom: 25px;
+    }
+
+    #intro-overlay input {
+      font-family: 'Press Start 2P', monospace;
+      font-size: 14px;
+      padding: 10px 18px;
+      border: none;
+      outline: none;
+      margin-bottom: 20px;
+      width: 260px;
+      text-align: center;
+    }
+
+    #intro-overlay button {
+      font-family: 'Press Start 2P', monospace;
+      font-size: 14px;
+      padding: 10px 26px;
+      cursor: pointer;
+    }
+
+    /* ✅ US MATCH COMBO Ending Overlay：独立大字图层 */
+    #combo-overlay {
+      position: fixed;
+      inset: 0;
+      /* 不加背景色，让下面的 p5 液体 blob 透出来 */
+      display: none;              /* 需要时由 JS 切为 flex */
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;       /* 不挡交互 */
+      z-index: 8;                 /* 高于 canvas / ranking / top message，低于 intro */
+      font-family: 'Press Start 2P', monospace;
+    }
+
+    #combo-overlay .combo-text {
+      text-align: center;
+      line-height: 1.1;
+      /* 超大字号：大约是以前的好几倍 */
+      font-size: 12vw;
+      color: #ffffff;
+      -webkit-text-stroke: 3px #000000;
+      text-stroke: 3px #000000;
+      white-space: pre-line;      /* 识别 \n 换行 */
+      /* 闪烁动画，模拟之前黑白闪光 */
+      animation: comboFlash 0.2s steps(1, end) infinite;
+    }
+
+    @keyframes comboFlash {
+      0%, 50% {
+        color: #ffffff;
+        -webkit-text-stroke: 3px #000000;
+        text-stroke: 3px #000000;
+      }
+      50.0001%, 100% {
+        color: #000000;
+        -webkit-text-stroke: 3px #ffffff;
+        text-stroke: 3px #ffffff;
+      }
     }
   </style>
 </head>
 
 <body>
+
+  <!-- 顶部提示（gathering / fusion / lockback 文案） -->
+  <div id="ui-top-message"></div>
+
+  <!-- 左侧总榜单（Yellow / Blue / Pink US） -->
+  <div id="ui-ranking"></div>
+
+  <!-- ✅ US MATCH COMBO Ending Overlay：US(换行)MATCH COMBO!! -->
+  <div id="combo-overlay">
+    <div class="combo-text">US
+MATCH COMBO!!</div>
+  </div>
+
+  <!-- 入口 overlay：英文规则说明 + 用户名 -->
+  <div id="intro-overlay">
+    <h1>MATCH US</h1>
+    <p>
+      Welcome to Match US!<br><br>
+      There are three US points: Yellow, Blue and Pink.<br>
+      At each US, at least two players need to cooperate to collect as many
+      match dots as possible.<br><br>
+      When the same group of players completes all three US tasks together,
+      you will trigger a MATCH&nbsp;US&nbsp;COMBO and join the ranking!
+    </p>
+
+    <input id="usernameInput" type="text" placeholder="ENTER YOUR NAME" />
+    <button id="startBtn">START</button>
+  </div>
+
+  <!-- p5.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.6.0/p5.min.js"></script>
+
+  <!-- socket.io -->
+  <script src="/socket.io/socket.io.js"></script>
+
+  <!-- your sketch -->
   <script src="sketch.js"></script>
+
 </body>
 </html>
